@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from flask import (
     Blueprint,
     Response,
@@ -20,6 +22,8 @@ from .manifest import ManifestError
 main_bp = Blueprint("main", __name__)
 api_bp = Blueprint("api", __name__, url_prefix="/api")
 
+_RANGE_HEADER_RE = re.compile(r"^bytes=(\d*)-(\d*)$", re.IGNORECASE)
+
 
 def _wants_json() -> bool:
     if request.path.startswith("/api/"):
@@ -37,7 +41,15 @@ def _error_response(exc: service.HandoverError):
         payload = {"error": exc.message}
         if exc.details:
             payload["details"] = exc.details
-        return jsonify(payload), exc.status
+        if exc.extra:
+            payload.update(exc.extra)
+        response = jsonify(payload)
+        response.status_code = exc.status
+        if exc.status == 416 and "total_bytes" in exc.extra:
+            response.headers["Content-Range"] = (
+                f"bytes */{int(exc.extra['total_bytes'])}"
+            )
+        return response
     return render_template("error.html", code=exc.status, message=exc.message), exc.status
 
 
@@ -95,10 +107,20 @@ def _state_json(state: dict) -> dict:
         "download_url": url_for("api.download_package", delivery_id=delivery["id"])
         if state["complete"]
         else None,
+        # 详情页/接口都按清单总长度接收半开区间 [start,end)。
+        "range_download_url": url_for(
+            "api.download_package", delivery_id=delivery["id"]
+        ),
+        "range_supported": True,
+        "range_endpoint": url_for(
+            "main.package_detail", delivery_id=delivery["id"]
+        ),
+        "range_parameters": "start/end（半开区间，单位字节）",
         "shards": [
             {
                 "index": s["index"],
                 "size": s["size"],
+                "offset": s["offset"],
                 "sha256": s["sha256"],
                 "accepted": s["accepted"],
                 "source": s["source"],
@@ -169,6 +191,10 @@ def create_package_page():
 
 @main_bp.get("/packages/<int:delivery_id>")
 def package_detail(delivery_id: int):
+    # 详情页同时承担按字节区间取件：带 start/end 查询参数时返回原始字节。
+    # （HTTP Range 头只在下载地址上生效，避免浏览器加载页面时被误判。）
+    if "start" in request.args or "end" in request.args:
+        return _download_response(delivery_id)
     try:
         state = service.delivery_state(delivery_id)
     except service.HandoverError as exc:
@@ -213,7 +239,141 @@ def recover_page(delivery_id: int):
     return redirect(url_for("main.package_detail", delivery_id=delivery_id))
 
 
+def _parse_range_header(value: str, total: int) -> tuple[int, int, bool]:
+    """解析单段 HTTP Range，转成半开区间 (start, end, is_suffix)。
+
+    HTTP 的 `bytes=a-b` 语义包含末字节 b，这里转换为半开区间 [a, b+1)。
+    `bytes=-N` 表示末尾 N 字节，返回 (0, N, True)，由调用方按总长度换算。
+    任何非法写法都以 416 拒绝，并附上清单总长度。
+    """
+    match = _RANGE_HEADER_RE.match(value.strip())
+    if match is None:
+        raise service.HandoverError(
+            "字节区间格式应为 bytes=start-end 或 bytes=start- 或 bytes=-N",
+            416,
+            extra={"total_bytes": total},
+        )
+    raw_start, raw_end = match.group(1), match.group(2)
+    if not raw_start and not raw_end:
+        raise service.HandoverError(
+            "字节区间缺少起止位置", 416, extra={"total_bytes": total}
+        )
+    if not raw_start:
+        # bytes=-N：最后 N 字节。
+        suffix = int(raw_end)
+        if suffix <= 0:
+            raise service.HandoverError(
+                "末尾长度必须为正数", 416, extra={"total_bytes": total}
+            )
+        return 0, suffix, True
+    start = int(raw_start)
+    if start >= total:
+        raise service.HandoverError(
+            f"字节区间起点 {start} 超出清单总长度 {total}",
+            416,
+            extra={"start": start, "total_bytes": total},
+        )
+    if not raw_end:
+        end = total
+    else:
+        # HTTP 语义：末尾越界按实际总长度截断。
+        end = min(int(raw_end) + 1, total)
+    if end <= start:
+        raise service.HandoverError(
+            f"字节区间 [{start}, {end}) 非法：结束必须大于开始",
+            416,
+            extra={"start": start, "end": end, "total_bytes": total},
+        )
+    return start, end, False
+
+
+def _range_query():
+    """取请求中的区间：优先 Range 头，其次 start/end 查询参数。"""
+    header = request.headers.get("Range")
+    if header:
+        return header, None
+    start = request.args.get("start")
+    end = request.args.get("end")
+    if start is not None or end is not None:
+        return None, (start, end)
+    return None, None
+
+
+def _range_error_response(exc: service.HandoverError):
+    """区间取件错误一律返回 JSON 元信息：缺片号与最早受阻偏移清晰可读。"""
+    payload = {"error": exc.message}
+    if exc.details:
+        payload["details"] = exc.details
+    payload.update(exc.extra)
+    response = jsonify(payload)
+    response.status_code = exc.status
+    if exc.status == 416 and "total_bytes" in exc.extra:
+        response.headers["Content-Range"] = f"bytes */{int(exc.extra['total_bytes'])}"
+    if "missing_shard" in exc.extra:
+        response.headers["X-Missing-Shard"] = str(int(exc.extra["missing_shard"]))
+    if "blocked_offset" in exc.extra:
+        response.headers["X-Blocked-Offset"] = str(int(exc.extra["blocked_offset"]))
+    return response
+
+
 def _download_response(delivery_id: int):
+    try:
+        total = service.delivery_total(delivery_id)
+    except service.HandoverError as exc:
+        return _error_response(exc)
+
+    header, query = _range_query()
+    if header is not None:
+        try:
+            start, end, is_suffix = _parse_range_header(header, total)
+        except service.HandoverError as exc:
+            return _range_error_response(exc)
+        if is_suffix:
+            start = max(0, total - end)
+            end = total
+            if start == end:
+                return _range_error_response(
+                    service.HandoverError(
+                        "交付包为空", 416, extra={"total_bytes": 0}
+                    )
+                )
+    elif query is not None:
+        raw_start, raw_end = query
+        try:
+            if raw_start is None or raw_end is None:
+                raise ValueError
+            start = int(str(raw_start).strip())
+            end = int(str(raw_end).strip())
+        except (TypeError, ValueError):
+            return _range_error_response(
+                service.HandoverError(
+                    "查询参数 start 与 end 必须是整数（半开区间）",
+                    416,
+                    extra={"total_bytes": total},
+                )
+            )
+    else:
+        return _full_download_response(delivery_id)
+
+    try:
+        _delivery, manifest, stream, start, end = service.open_range(
+            delivery_id, start, end
+        )
+    except service.HandoverError as exc:
+        return _range_error_response(exc)
+    total = manifest.total_bytes
+    response = Response(stream(), status=206, mimetype="application/octet-stream")
+    response.headers["Content-Range"] = f"bytes {start}-{end - 1}/{total}"
+    response.headers["Content-Length"] = str(end - start)
+    response.headers["Accept-Ranges"] = "bytes"
+    response.headers["Content-Disposition"] = (
+        f'attachment; filename="flow-section-{delivery_id}-{start}-{end}.bin"'
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+def _full_download_response(delivery_id: int):
     try:
         _delivery, manifest, stream = service.open_download(delivery_id)
     except service.HandoverError as exc:
@@ -223,6 +383,7 @@ def _download_response(delivery_id: int):
         f'attachment; filename="flow-section-{delivery_id}.bin"'
     )
     response.headers["Content-Length"] = str(manifest.total_bytes)
+    response.headers["Accept-Ranges"] = "bytes"
     response.headers["X-Shard-Order"] = ",".join(map(str, manifest.indices))
     response.headers["Cache-Control"] = "no-store"
     return response

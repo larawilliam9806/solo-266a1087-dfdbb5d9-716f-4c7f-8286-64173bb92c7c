@@ -174,6 +174,29 @@ def iter_part(path: str, chunk_size: int = READ_SIZE):
             yield block
 
 
+def iter_part_slice(
+    path: str,
+    offset: int,
+    length: int,
+    chunk_size: int = READ_SIZE,
+):
+    """产出单片内 [offset, offset+length) 的字节。
+
+    逐块读取，内存开销只与 chunk_size 有关，与片大小无关。
+    """
+    if length <= 0:
+        return
+    remaining = length
+    with open(path, "rb") as handle:
+        handle.seek(offset)
+        while remaining > 0:
+            block = handle.read(min(chunk_size, remaining))
+            if not block:
+                raise CodecError("分片长度不足，与清单声明不符")
+            remaining -= len(block)
+            yield block
+
+
 def checkshard_bytes(parts: list[bytes], length: int) -> bytes:
     """测试与工具用：纯内存版本，语义与 build_checkshard 相同。"""
     acc = bytearray(length)

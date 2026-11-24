@@ -1,4 +1,4 @@
-"""交接业务：建包、逐片验收、缺片恢复、拼接下载。"""
+"""交接业务：建包、逐片验收、缺片恢复、拼接下载、按字节区间取件。"""
 
 from __future__ import annotations
 
@@ -13,11 +13,19 @@ from .manifest import Manifest, manifest_digest, parse_manifest
 
 
 class HandoverError(Exception):
-    def __init__(self, message: str, status: int = 400, details: list[str] | None = None):
+    def __init__(
+        self,
+        message: str,
+        status: int = 400,
+        details: list[str] | None = None,
+        extra: dict | None = None,
+    ):
         super().__init__(message)
         self.message = message
         self.status = status
         self.details = details or []
+        # 结构化补充字段（如缺片号、最早受阻偏移），随 JSON 错误一并返回。
+        self.extra = extra or {}
 
 
 def _data_dir() -> str:
@@ -62,6 +70,7 @@ def delivery_state(delivery_id: int) -> dict:
     missing = []
     accepted = 0
     accepted_bytes = 0
+    offset = 0
     for row in rows:
         spec = manifest.by_index[row["shard_index"]]
         done = row["accepted_at"] is not None
@@ -74,6 +83,7 @@ def delivery_state(delivery_id: int) -> dict:
             {
                 "index": spec.index,
                 "size": spec.size,
+                "offset": offset,
                 "sha256": spec.sha256,
                 "accepted": done,
                 "source": row["source"],
@@ -83,6 +93,7 @@ def delivery_state(delivery_id: int) -> dict:
                 "is_longest": spec.size == manifest.max_size,
             }
         )
+        offset += spec.size
     return {
         "delivery": delivery,
         "manifest": manifest,
@@ -409,27 +420,21 @@ def recover_missing(delivery_id: int, index: int, file_storage) -> dict:
             storage.remove_file(recovered_tmp)
 
 
-def open_download(delivery_id: int):
-    """拼接下载：集齐后才开放；按片号升序、固定块大小流式输出。"""
+def _download_snapshot(delivery_id: int):
+    """读取受理时的交付状态快照：清单、各片验收情况、已验收片集合。
+
+    下载/区间取件都只在本次请求内使用这份快照；此后并发上传或恢复
+    不会改变本次的返回结果。
+    """
     conn = db.get_db()
     delivery = _delivery(conn, delivery_id)
     manifest = _manifest_of(delivery)
     rows = _shard_rows(conn, delivery_id)
-    missing = [r["shard_index"] for r in rows if r["accepted_at"] is None]
-    if missing:
-        raise HandoverError(
-            f"尚缺 {len(missing)} 片（{', '.join(map(str, missing))}），暂不能下载",
-            409,
-        )
+    accepted = {r["shard_index"] for r in rows if r["accepted_at"] is not None}
+    return conn, delivery, manifest, rows, accepted
 
-    chunk = _chunk()
-    data_dir = _data_dir()
 
-    def generate():
-        for row in rows:
-            path = storage.part_path(data_dir, delivery_id, row["shard_index"])
-            yield from codec.iter_part(path, chunk)
-
+def _count_download(conn, delivery_id: int) -> None:
     now = db.utcnow()
     with db.write_tx(conn):
         conn.execute(
@@ -438,4 +443,110 @@ def open_download(delivery_id: int):
                WHERE id = ?""",
             (now, int(delivery_id)),
         )
+
+
+def open_download(delivery_id: int):
+    """拼接下载：集齐后才开放；按片号升序、固定块大小流式输出。"""
+    conn, delivery, manifest, rows, accepted = _download_snapshot(delivery_id)
+    missing = [r["shard_index"] for r in rows if r["shard_index"] not in accepted]
+    if missing:
+        raise HandoverError(
+            f"尚缺 {len(missing)} 片（{', '.join(map(str, missing))}），暂不能下载",
+            409,
+        )
+
+    chunk = _chunk()
+    data_dir = _data_dir()
+    # 快照内各片路径固定；生成器只在本次请求内读取。
+    plan = [
+        (storage.part_path(data_dir, delivery_id, row["shard_index"]), manifest.by_index[row["shard_index"]].size)
+        for row in rows
+    ]
+
+    def generate():
+        for path, size in plan:
+            yield from codec.iter_part_slice(path, 0, size, chunk)
+
+    _count_download(conn, delivery_id)
     return delivery, manifest, generate
+
+
+def delivery_total(delivery_id: int) -> int:
+    """清单总长度（字节）。用于区间校验与 416 的 Content-Range。"""
+    conn = db.get_db()
+    delivery = _delivery(conn, delivery_id)
+    return _manifest_of(delivery).total_bytes
+
+
+def _range_plan(manifest: Manifest, accepted: set[int], start: int, end: int):
+    """把半开区间 [start,end) 映射为各片的读取切片，并找出阻挡的缺片。"""
+    plan = []
+    blocked = []
+    position = 0
+    for spec in manifest.shards:
+        shard_start = position
+        shard_end = position + spec.size
+        position = shard_end
+        if shard_end <= start or shard_start >= end:
+            continue
+        if spec.index not in accepted:
+            blocked.append((spec.index, max(start, shard_start)))
+            continue
+        slice_start = max(start, shard_start) - shard_start
+        slice_end = min(end, shard_end) - shard_start
+        plan.append((spec.index, slice_start, slice_end - slice_start))
+    return plan, blocked
+
+
+def open_range(delivery_id: int, start: int, end: int):
+    """按清单总长度取半开区间 [start,end) 的原始字节。
+
+    以受理时的验收快照为准：仅当区间覆盖到的片全部已验收时才返回 206 与
+    Content-Range；碰到缺片则返回 409，携带缺片号与最早受阻偏移，不返回正文。
+    非法区间与缺片都不会增加下载次数。
+    """
+    conn, delivery, manifest, _rows, accepted = _download_snapshot(delivery_id)
+    total = manifest.total_bytes
+
+    if start < 0 or end <= start or end > total:
+        raise HandoverError(
+            f"字节区间 [{start}, {end}) 非法：须满足 0 ≤ start < end ≤ {total}",
+            416,
+            extra={"start": start, "end": end, "total_bytes": total},
+        )
+
+    plan, blocked = _range_plan(manifest, accepted, start, end)
+    if blocked:
+        missing_indices = sorted({index for index, _offset in blocked})
+        first_index, blocked_offset = blocked[0]
+        raise HandoverError(
+            f"区间 [{start}, {end}) 碰到缺片 {first_index}，"
+            f"最早受阻偏移 {blocked_offset}，本次不返回正文",
+            409,
+            extra={
+                "start": start,
+                "end": end,
+                "total_bytes": total,
+                "missing": missing_indices,
+                "missing_shards": missing_indices,
+                "missing_shard": first_index,
+                "missing_index": first_index,
+                "blocked_offset": blocked_offset,
+                "first_blocked_offset": blocked_offset,
+            },
+        )
+
+    chunk = _chunk()
+    data_dir = _data_dir()
+    # 快照内已验收片的路径与切片长度在此固定，生成器不再查库。
+    sources = [
+        (storage.part_path(data_dir, delivery_id, index), offset, length)
+        for index, offset, length in plan
+    ]
+
+    def generate():
+        for path, offset, length in sources:
+            yield from codec.iter_part_slice(path, offset, length, chunk)
+
+    _count_download(conn, delivery_id)
+    return delivery, manifest, generate, start, end

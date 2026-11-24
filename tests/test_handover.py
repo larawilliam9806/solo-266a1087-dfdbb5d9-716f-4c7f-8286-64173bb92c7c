@@ -16,6 +16,7 @@ import unittest
 
 from app import create_app
 from app import codec
+from app import service
 
 
 def sha(data: bytes) -> str:
@@ -361,6 +362,244 @@ class HandoverTestCase(unittest.TestCase):
         )
         self.assertEqual(page.status_code, 200)
         self.assertIn("已验收", page.get_data(as_text=True))
+
+    # ------------------------------------------------------- 按字节区间取件
+    def _offsets(self):
+        offsets = []
+        position = 0
+        for part in self.parts:
+            offsets.append(position)
+            position += len(part)
+        return offsets
+
+    def _download_count(self, delivery_id):
+        page = self.client.get(f"/packages/{delivery_id}").get_data(as_text=True)
+        marker = "本包累计下载 "
+        start = page.index(marker) + len(marker)
+        return int(page[start : page.index(" 次", start)])
+
+    def test_range_serves_accepted_bytes_from_incomplete_package(self):
+        delivery_id = self.create().get_json()["id"]
+        self.upload(delivery_id, 0, self.parts[0])  # 200 字节
+        self.upload(delivery_id, 1, self.parts[1])  # 260 字节
+        offsets = self._offsets()
+        start = offsets[0] + 150  # 片 0 尾部
+        end = offsets[1] + 40  # 片 1 内
+        response = self.client.get(
+            f"/api/packages/{delivery_id}/download?start={start}&end={end}"
+        )
+        self.assertEqual(response.status_code, 206, response.data)
+        self.assertEqual(response.data, b"".join(self.parts)[start:end])
+        self.assertEqual(
+            response.headers["Content-Range"],
+            f"bytes {start}-{end - 1}/{sum(map(len, self.parts))}",
+        )
+        self.assertEqual(response.headers["Content-Length"], str(end - start))
+        self.assertEqual(response.headers["Accept-Ranges"], "bytes")
+
+    def test_range_range_header_is_inclusive(self):
+        delivery_id = self.create().get_json()["id"]
+        self.upload_all_except(delivery_id, skip=None)
+        blob = b"".join(self.parts)
+        response = self.client.get(
+            f"/api/packages/{delivery_id}/download",
+            headers={"Range": "bytes=10-19"},
+        )
+        self.assertEqual(response.status_code, 206, response.data)
+        self.assertEqual(response.data, blob[10:20])
+        self.assertEqual(
+            response.headers["Content-Range"], f"bytes 10-19/{len(blob)}"
+        )
+
+    def test_range_suffix_header(self):
+        delivery_id = self.create().get_json()["id"]
+        self.upload_all_except(delivery_id, skip=None)
+        blob = b"".join(self.parts)
+        response = self.client.get(
+            f"/api/packages/{delivery_id}/download",
+            headers={"Range": "bytes=-25"},
+        )
+        self.assertEqual(response.status_code, 206, response.data)
+        self.assertEqual(response.data, blob[-25:])
+        self.assertEqual(
+            response.headers["Content-Range"],
+            f"bytes {len(blob) - 25}-{len(blob) - 1}/{len(blob)}",
+        )
+
+    def test_range_blocked_by_missing_shard_returns_no_body(self):
+        delivery_id = self.create().get_json()["id"]
+        self.upload(delivery_id, 0, self.parts[0])
+        offsets = self._offsets()
+        start = offsets[1]  # 片 1 缺
+        end = offsets[2] + 10
+        before = self._download_count(delivery_id)
+        response = self.client.get(
+            f"/api/packages/{delivery_id}/download?start={start}&end={end}"
+        )
+        self.assertEqual(response.status_code, 409, response.data)
+        body = response.get_json()
+        self.assertEqual(body["missing_shard"], 1)
+        self.assertEqual(body["missing"], [1, 2])
+        self.assertEqual(body["blocked_offset"], offsets[1])
+        self.assertEqual(body["start"], start)
+        self.assertEqual(body["end"], end)
+        self.assertIsNone(body.get("data"))
+        self.assertEqual(
+            response.headers["X-Missing-Shard"], "1"
+        )
+        self.assertEqual(response.headers["X-Blocked-Offset"], str(offsets[1]))
+        # 缺片不增加下载次数，也不返回正文。
+        self.assertEqual(response.mimetype, "application/json")
+        self.assertEqual(self._download_count(delivery_id), before)
+
+    def test_range_blocked_offset_starts_inside_range(self):
+        delivery_id = self.create().get_json()["id"]
+        self.upload(delivery_id, 0, self.parts[0])
+        offsets = self._offsets()
+        # 从片 1 中间开始，最早受阻偏移就是请求起点。
+        start = offsets[1] + 5
+        response = self.client.get(
+            f"/api/packages/{delivery_id}/download?start={start}&end={offsets[1] + 30}"
+        )
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.get_json()["blocked_offset"], start)
+
+    def test_invalid_ranges_rejected_without_counting(self):
+        delivery_id = self.create().get_json()["id"]
+        self.upload(delivery_id, 0, self.parts[0])
+        total = sum(map(len, self.parts))
+        before = self._download_count(delivery_id)
+        for query in (
+            "start=10&end=10",
+            "start=20&end=10",
+            "start=-1&end=5",
+            f"start=0&end={total + 1}",
+            "start=abc&end=5",
+            "start=0",
+            "end=5",
+        ):
+            response = self.client.get(
+                f"/api/packages/{delivery_id}/download?{query}"
+            )
+            self.assertEqual(response.status_code, 416, (query, response.data))
+            body = response.get_json()
+            self.assertIn("total_bytes", body)
+            self.assertEqual(response.headers["Content-Range"], f"bytes */{total}")
+        for raw in ("bytes=5-1", "bytes=abc", "bytes=", f"bytes={total}-"):
+            response = self.client.get(
+                f"/api/packages/{delivery_id}/download", headers={"Range": raw}
+            )
+            self.assertEqual(response.status_code, 416, (raw, response.data))
+            self.assertEqual(response.headers["Content-Range"], f"bytes */{total}")
+        self.assertEqual(self._download_count(delivery_id), before)
+
+    def test_range_header_clamps_past_end(self):
+        delivery_id = self.create().get_json()["id"]
+        self.upload_all_except(delivery_id, skip=None)
+        blob = b"".join(self.parts)
+        response = self.client.get(
+            f"/api/packages/{delivery_id}/download",
+            headers={"Range": f"bytes=600-{len(blob) + 500}"},
+        )
+        self.assertEqual(response.status_code, 206, response.data)
+        self.assertEqual(response.data, blob[600:])
+        self.assertEqual(
+            response.headers["Content-Range"],
+            f"bytes 600-{len(blob) - 1}/{len(blob)}",
+        )
+
+    def test_successful_range_counts_one_download(self):
+        delivery_id = self.create().get_json()["id"]
+        self.upload_all_except(delivery_id, skip=None)
+        before = self._download_count(delivery_id)
+        ok = self.client.get(
+            f"/api/packages/{delivery_id}/download?start=0&end=5"
+        )
+        self.assertEqual(ok.status_code, 206)
+        self.assertEqual(self._download_count(delivery_id), before + 1)
+
+    def test_range_on_detail_page_returns_raw_bytes(self):
+        delivery_id = self.create().get_json()["id"]
+        self.upload(delivery_id, 0, self.parts[0])
+        response = self.client.get(f"/packages/{delivery_id}?start=0&end=12")
+        self.assertEqual(response.status_code, 206, response.data)
+        self.assertEqual(response.data, self.parts[0][:12])
+        # 不带区间参数仍是详情页。
+        page = self.client.get(f"/packages/{delivery_id}")
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("按字节区间取件", page.get_data(as_text=True))
+
+    def test_range_uses_acceptance_snapshot(self):
+        """受理快照之后完成的验收不会改变本次结果。"""
+        delivery_id = self.create().get_json()["id"]
+        self.upload(delivery_id, 0, self.parts[0])
+        offsets = self._offsets()
+        start, end = offsets[1], offsets[1] + len(self.parts[1])
+
+        original = service._shard_rows
+        snapshot_taken = threading.Event()
+        release = threading.Event()
+
+        def slow_rows(conn, target_id):
+            rows = original(conn, target_id)
+            snapshot_taken.set()
+            release.wait(5)
+            return rows
+
+        service._shard_rows = slow_rows
+        try:
+            result = {}
+
+            def request_range():
+                result["response"] = self.client.get(
+                    f"/api/packages/{delivery_id}/download?start={start}&end={end}"
+                )
+
+            thread = threading.Thread(target=request_range)
+            thread.start()
+            self.assertTrue(snapshot_taken.wait(5))
+            # 快照已取：此时补交缺片 1。
+            self.upload(delivery_id, 1, self.parts[1])
+            release.set()
+            thread.join(10)
+        finally:
+            service._shard_rows = original
+
+        response = result["response"]
+        self.assertEqual(response.status_code, 409, response.data)
+        self.assertEqual(response.get_json()["missing_shard"], 1)
+
+        # 之后的请求按新状态返回成功。
+        again = self.client.get(
+            f"/api/packages/{delivery_id}/download?start={start}&end={end}"
+        )
+        self.assertEqual(again.status_code, 206, again.data)
+        self.assertEqual(again.data, self.parts[1])
+
+    def test_range_streams_in_fixed_chunks(self):
+        delivery_id = self.create().get_json()["id"]
+        self.upload_all_except(delivery_id, skip=None)
+        chunk = self.app.config["CHUNK_SIZE"]
+        with self.app.app_context():
+            _delivery, _manifest, stream, start, end = service.open_range(
+                delivery_id, 0, sum(map(len, self.parts))
+            )
+            blocks = list(stream())
+        self.assertEqual(b"".join(blocks), b"".join(self.parts))
+        self.assertGreater(len(blocks), 1)
+        self.assertTrue(all(len(block) <= chunk for block in blocks))
+
+    def test_range_shard_offsets_exposed_in_state(self):
+        delivery_id = self.create().get_json()["id"]
+        state = self.client.get(f"/api/packages/{delivery_id}").get_json()
+        self.assertEqual(
+            [s["offset"] for s in state["shards"]], self._offsets()
+        )
+        self.assertTrue(state["range_supported"])
+        self.assertEqual(
+            state["range_download_url"],
+            f"/api/packages/{delivery_id}/download",
+        )
 
 
 if __name__ == "__main__":

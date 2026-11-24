@@ -46,6 +46,37 @@
   {% endif %}
 </section>
 
+<section class="card">
+  <h2>按字节区间取件</h2>
+  <p class="hint">
+    清单总长度 {{ m.total_bytes }} 字节，按半开区间 <span class="mono">[start, end)</span> 取件，
+    不含 end。仅当区间覆盖到的片全部验收后才返回原始字节（206 + <span class="mono">Content-Range</span>）；
+    碰到缺片时返回缺片号与最早受阻偏移，且不返回正文。
+    本次结果以受理时的验收快照为准，期间上传或恢复不改变本次结果。
+  </p>
+  <form class="stack" method="get"
+        action="{{ url_for('main.package_detail', delivery_id=d.id) }}">
+    <div class="row">
+      <label class="field">
+        <span>起始偏移 start</span>
+        <input type="number" name="start" min="0" max="{{ m.total_bytes - 1 }}"
+               value="0" required>
+      </label>
+      <label class="field">
+        <span>结束偏移 end（不含）</span>
+        <input type="number" name="end" min="1" max="{{ m.total_bytes }}"
+               value="{{ m.total_bytes }}" required>
+      </label>
+      <button type="submit">取此区间</button>
+    </div>
+  </form>
+  <p class="small muted">
+    接口地址：<span class="mono">{{ url_for('api.download_package', delivery_id=d.id) }}?start=…&amp;end=…</span>。
+    同一地址也接受 <span class="mono">Range: bytes=start-end</span>（HTTP 语义，含 end）。
+    只有返回正文的成功请求才计入下载次数，非法区间与缺片不计数。
+  </p>
+</section>
+
 {% if state.recovery_allowed %}
 <section class="card">
   <h2>用校验片恢复缺片</h2>
@@ -74,7 +105,7 @@
     <table>
       <thead>
         <tr>
-          <th class="num">片号</th><th class="num">字节数</th><th>SHA-256</th>
+          <th class="num">片号</th><th class="num">起始偏移</th><th class="num">字节数</th><th>SHA-256</th>
           <th>状态</th><th>来源</th><th>验收时间</th><th>操作</th>
         </tr>
       </thead>
@@ -82,6 +113,7 @@
       {% for s in state.shards %}
         <tr class="{{ 'row-done' if s.accepted else 'row-missing' }}">
           <td class="num mono">{{ s.index }}{% if s.is_longest %} <span class="pill mini">最长</span>{% endif %}</td>
+          <td class="num mono">{{ s.offset }}</td>
           <td class="num mono">{{ s.size }}</td>
           <td class="mono tiny" title="{{ s.sha256 }}">{{ s.sha256[:20] }}…</td>
           <td>
